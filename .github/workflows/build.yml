@@ -16,8 +16,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-      - run: gradle assembleDebug --no-daemon
-      - run: cp app/build/outputs/apk/debug/app-debug.apk SyncMusic.apk
+      - run: gradle assembleRelease --no-daemon
+      - run: cp app/build/outputs/apk/release/app-release.apk SyncMusic.apk && ls -la SyncMusic.apk
       - uses: actions/upload-artifact@v4
         with:
           name: SyncMusic-apk
@@ -28,6 +28,6 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: SyncMusic build ${{ github.run_number }}
-          body: Tap SyncMusic.apk below to download and install.
+          body: Tap SyncMusic.apk below to download and install. Builds from 4 on are signed with the same key, so they install over each other.
           files: SyncMusic.apk
           make_latest: true

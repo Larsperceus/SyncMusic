@@ -9,8 +9,8 @@ import android.os.Handler
 import android.os.Looper
 
 /**
- * Wi-Fi Direct helper. The host creates a group (it becomes the "access point",
- * always at 192.168.49.1); listeners join it. No router or internet involved.
+ * Wi-Fi Direct: the host creates a group with a fixed name and password (always at
+ * 192.168.49.1); listeners join by tapping it, scanning its QR code, or rejoining.
  */
 @SuppressLint("MissingPermission") // permissions are requested in MainActivity
 object P2p {
@@ -28,9 +28,9 @@ object P2p {
     }
 
     private fun reason(code: Int) = when (code) {
-        WifiP2pManager.P2P_UNSUPPORTED -> "this phone doesn't support Wi-Fi Direct"
-        WifiP2pManager.BUSY -> "Wi-Fi Direct is busy, try again"
-        else -> "is Wi-Fi turned on? (code $code)"
+        WifiP2pManager.P2P_UNSUPPORTED -> "This phone doesn't support Wi-Fi Direct."
+        WifiP2pManager.BUSY -> "Wi-Fi Direct is busy. Try again in a moment."
+        else -> "Turn on Wi-Fi and try again."
     }
 
     private fun cb(ok: () -> Unit = {}, fail: (String) -> Unit = {}) =
@@ -39,36 +39,58 @@ object P2p {
             override fun onFailure(r: Int) = fail(reason(r))
         }
 
-    fun createGroup(done: (String) -> Unit) {
-        val m = manager ?: return done("Wi-Fi Direct unavailable")
-        // Drop any old group first, then create a fresh one.
-        m.removeGroup(channel, cb(ok = { main.postDelayed({ make(done) }, 600) }, fail = { make(done) }))
+    fun createGroup(ssid: String, pass: String, done: (String?) -> Unit) {
+        val m = manager ?: return done("Wi-Fi Direct isn't available on this phone.")
+        m.removeGroup(channel, cb(ok = { main.postDelayed({ make(ssid, pass, done) }, 600) }, fail = { make(ssid, pass, done) }))
     }
 
-    private fun make(done: (String) -> Unit) {
-        manager?.createGroup(channel, cb(
-            ok = { done("Wi-Fi Direct on. The other phone can now find this one.") },
-            fail = { done("Wi-Fi Direct failed: $it. Use the IP instead.") }))
+    private fun make(ssid: String, pass: String, done: (String?) -> Unit) {
+        val m = manager ?: return
+        val cfg = runCatching {
+            WifiP2pConfig.Builder().setNetworkName(ssid).setPassphrase(pass)
+                .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_AUTO).build()
+        }.getOrNull()
+        val onOk = { main.postDelayed({ readGroup() }, 800); done(null) }
+        val plain = { m.createGroup(channel, cb(ok = onOk, fail = { done("Wi-Fi Direct failed. $it") })) }
+        if (cfg == null) plain()
+        else m.createGroup(channel, cfg, cb(ok = onOk, fail = { plain() }))
     }
 
-    fun removeGroup() { manager?.removeGroup(channel, cb()) }
-
-    fun discover(done: (String) -> Unit) {
-        val m = manager ?: return done("Wi-Fi Direct unavailable")
-        m.discoverPeers(channel, cb(
-            ok = { done("Searching for nearby phones…") },
-            fail = { done("Search failed: $it") }))
+    private fun readGroup() {
+        manager?.requestGroupInfo(channel) { g ->
+            if (g != null && g.isGroupOwner && !g.passphrase.isNullOrEmpty())
+                AppState.group.value = JoinInfo(AppState.myName.value ?: "SyncMusic", g.networkName, g.passphrase)
+        }
     }
 
-    fun connect(address: String, done: (String) -> Unit) {
-        val m = manager ?: return done("Wi-Fi Direct unavailable")
+    fun removeGroup() {
+        AppState.group.value = null
+        manager?.removeGroup(channel, cb())
+    }
+
+    fun discover(done: (String?) -> Unit) {
+        val m = manager ?: return done("Wi-Fi Direct isn't available on this phone.")
+        m.discoverPeers(channel, cb(ok = { done(null) }, fail = { done("Couldn't search. $it") }))
+    }
+
+    /** Join a group we have the name and password for: no invite popup on the host. */
+    fun join(j: JoinInfo, done: (String?) -> Unit) {
+        val m = manager ?: return done("Wi-Fi Direct isn't available on this phone.")
+        val cfg = WifiP2pConfig.Builder().setNetworkName(j.ssid).setPassphrase(j.pass).build()
+        m.connect(channel, cfg, cb(
+            ok = { done("Joining ${j.name}…") },
+            fail = { done("Couldn't join ${j.name}. Is it sharing right now? $it") }))
+    }
+
+    fun connect(address: String, done: (String?) -> Unit) {
+        val m = manager ?: return done("Wi-Fi Direct isn't available on this phone.")
         val cfg = WifiP2pConfig().apply {
             deviceAddress = address
-            groupOwnerIntent = 0          // we want to join, not host
+            groupOwnerIntent = 0
             wps.setup = WpsInfo.PBC
         }
         m.connect(channel, cfg, cb(
-            ok = { done("Connecting… accept the invitation on the host phone if asked.") },
-            fail = { done("Connect failed: $it") }))
+            ok = { done("Connecting… accept the invite on the sharing phone if it asks.") },
+            fail = { done("Couldn't connect. $it") }))
     }
 }

@@ -14,12 +14,15 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import com.syncmusic.ui.Actions
 import com.syncmusic.ui.SyncApp
 import com.syncmusic.ui.SyncTheme
@@ -43,14 +46,23 @@ class MainActivity : ComponentActivity() {
     private val captureLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
             if (r.resultCode != RESULT_OK || r.data == null) {
-                toast("Sharing needs the screen-share permission (only audio is used).")
+                toast("Sharing needs the screen-share permission. Only the sound is used.")
                 return@registerForActivityResult
             }
             startForegroundService(Intent(this, HostService::class.java)
                 .putExtra("code", r.resultCode).putExtra("data", r.data))
-            if (granted(wifiPerms())) P2p.createGroup { AppState.p2pMessage.value = it }
-            else AppState.p2pMessage.value = "Nearby-devices permission is off, so connect by IP."
+            if (granted(wifiPerms())) {
+                val (ssid, pass) = Prefs.hostCreds(this)
+                P2p.createGroup(ssid, pass) { AppState.p2pMessage.value = it }
+            } else AppState.p2pMessage.value = "Nearby-devices permission is off, so friends need to connect by IP."
         }
+
+    private val scanLauncher = registerForActivityResult(ScanContract()) { r ->
+        val text = r.contents ?: return@registerForActivityResult
+        val j = JoinInfo.fromQr(text)
+        if (j == null) toast("That's not a SyncMusic code. Scan the code on the sharing phone.")
+        else join(j)
+    }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -71,7 +83,7 @@ class MainActivity : ComponentActivity() {
                     val d: WifiP2pDevice? = if (Build.VERSION.SDK_INT >= 33)
                         i.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE, WifiP2pDevice::class.java)
                     else @Suppress("DEPRECATION") i.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
-                    AppState.myName.value = d?.deviceName
+                    AppState.myName.value = d?.deviceName?.ifBlank { null }
                 }
             }
         }
@@ -84,6 +96,7 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         P2p.init(this)
+        Prefs.load(this)
 
         val filter = IntentFilter().apply {
             addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
@@ -94,9 +107,8 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, filter)
 
-        val prefs = getPreferences(MODE_PRIVATE)
         val actions = Actions(
-            savedIp = prefs.getString("ip", "") ?: "",
+            savedIp = Prefs.savedIp(this),
             startSharing = ::startSharing,
             stopSharing = {
                 stopService(Intent(this, HostService::class.java))
@@ -104,16 +116,31 @@ class MainActivity : ComponentActivity() {
             },
             findHosts = ::findHosts,
             connectPeer = ::connectPeer,
-            connectIp = { ip ->
-                prefs.edit().putString("ip", ip).apply()
-                startListener(ip, ip)
+            connectIp = { ip -> Prefs.saveIp(this, ip); startListener(ip, ip) },
+            scanCode = {
+                scanLauncher.launch(ScanOptions()
+                    .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                    .setPrompt("Scan the code on the sharing phone")
+                    .setBeepEnabled(false)
+                    .setOrientationLocked(false))
             },
+            rejoin = { AppState.lastHost.value?.let { join(it) } },
             stopListening = {
                 stopService(Intent(this, ListenerService::class.java))
                 P2p.removeGroup()
             },
+            allowMediaAccess = {
+                runCatching { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+            },
+            setSyncOffset = { Prefs.saveSyncOffset(this, it) },
         )
         setContent { SyncTheme { SyncApp(actions) } }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppState.mediaAccess.value = Media.hasAccess(this)
+        Media.start(this)
     }
 
     override fun onDestroy() {
@@ -140,6 +167,14 @@ class MainActivity : ComponentActivity() {
         ensurePerms(wifiPerms(), notifPerm()) {
             AppState.peers.value = emptyList()
             P2p.discover { AppState.p2pMessage.value = it }
+        }
+    }
+
+    private fun join(j: JoinInfo) {
+        ensurePerms(wifiPerms(), notifPerm()) {
+            wantListen = true
+            pendingName = j.name
+            P2p.join(j) { AppState.p2pMessage.value = it }
         }
     }
 
