@@ -11,12 +11,13 @@ streams it over Wi-Fi → Phone B plays it on its Bluetooth headphones/speaker.
 
 Or open the folder in Android Studio and press Run.
 
-## Use it
-1. Both phones on the same Wi-Fi, or one phone's hotspot with the other joined to it.
+## Use it (Wi-Fi Direct, no router needed)
+1. Turn Wi-Fi on on both phones (they do not need to be connected to a network).
 2. **Phone A:** Start hosting → allow audio → choose *entire screen* → play music.
    The status line shows the captured level; "silence" while music plays means
    that app blocks capture.
-3. **Phone B:** connect Bluetooth headphones, type Phone A's IP (shown on Phone A), Start listening.
+3. **Phone B:** connect Bluetooth headphones, tap **Find host phone**, tap Phone A in the list
+   (accept the invite on Phone A if it asks). On the same Wi-Fi you can also connect by IP.
 
 ## Limits of this POC
 - Android 10+ only. Some apps opt out of capture (often DRM/premium content); test yours.
