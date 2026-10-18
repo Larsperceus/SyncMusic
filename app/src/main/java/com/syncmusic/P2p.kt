@@ -53,7 +53,7 @@ object P2p {
         val onOk = { main.postDelayed({ readGroup() }, 800); done(null) }
         val plain = { m.createGroup(channel, cb(ok = onOk, fail = { done("Wi-Fi Direct failed. $it") })) }
         if (cfg == null) plain()
-        else m.createGroup(channel, cfg, cb(ok = onOk, fail = { plain() }))
+        else m.createGroup(channel!!, cfg, cb(ok = onOk, fail = { plain() }))
     }
 
     private fun readGroup() {
