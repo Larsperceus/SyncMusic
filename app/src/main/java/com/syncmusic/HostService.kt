@@ -23,6 +23,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.sqrt
+import kotlinx.coroutines.flow.update
 
 /**
  * Captures what other apps are playing (Android 10+ AudioPlaybackCapture)
@@ -53,13 +55,14 @@ class HostService : Service() {
 
         val mpm = getSystemService(MediaProjectionManager::class.java)
         val proj = mpm.getMediaProjection(code, data)
-        if (proj == null) { SyncStatus.set("Could not get capture permission"); stopSelf(); return START_NOT_STICKY }
+        if (proj == null) { AppState.host.update { it.copy(message = "Android didn't grant audio sharing. Try again.") }; stopSelf(); return START_NOT_STICKY }
         proj.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() { stopSelf() }
         }, Handler(Looper.getMainLooper()))
         projection = proj
 
         active = true
+        AppState.host.value = HostState(running = true, message = "Play something in any music app.")
         thread(name = "accept") { acceptLoop() }
         thread(name = "capture") { captureLoop(proj) }
         return START_NOT_STICKY
@@ -75,7 +78,7 @@ class HostService : Service() {
                 Client(s).also { clients += it; it.start() }
             }
         } catch (e: Exception) {
-            if (active) SyncStatus.set("Server error: ${e.message}")
+            if (active) AppState.host.update { it.copy(message = "Couldn't open the connection: ${e.message}") }
         }
     }
 
@@ -101,7 +104,7 @@ class HostService : Service() {
                 .setAudioPlaybackCaptureConfig(config)
                 .build()
         } catch (e: Exception) {
-            SyncStatus.set("Could not start capture: ${e.message}")
+            AppState.host.update { it.copy(message = "Couldn't start sharing: ${e.message}") }
             stopSelf(); return
         }
 
@@ -110,15 +113,15 @@ class HostService : Service() {
             val chunk = ByteArray(Audio.CHUNK)
             var peak = 0
             var lastReport = 0L
+            var silentSince = System.currentTimeMillis()
             while (active) {
                 val n = rec.read(chunk, 0, chunk.size)
-                if (n < 0) { SyncStatus.set("Capture error ($n)"); break }
+                if (n < 0) { AppState.host.update { it.copy(message = "Audio capture stopped ($n).") }; break }
                 if (n == 0) continue
                 val len = n - n % Audio.BYTES_PER_FRAME
                 val copy = chunk.copyOf(len)
                 for (c in clients) c.offer(copy)
 
-                // Level meter: helps you see if the music app blocks capture (= silence).
                 var i = 0
                 while (i + 1 < len) {
                     val s = (copy[i].toInt() and 0xff) or (copy[i + 1].toInt() shl 8)
@@ -126,9 +129,12 @@ class HostService : Service() {
                     i += 8
                 }
                 val now = System.currentTimeMillis()
-                if (now - lastReport > 1000) {
-                    val level = if (peak < 50) "silence" else "${peak * 100 / 32768}%"
-                    SyncStatus.set("Hosting • ${clients.size} listener(s) • captured level: $level")
+                if (now - lastReport >= 80) {
+                    if (peak >= 50) silentSince = now
+                    val msg = if (now - silentSince > 4000)
+                        "Nothing to share yet. Play music, or this app may block sharing." else null
+                    val level = sqrt(peak / 32768f)
+                    AppState.host.update { it.copy(level = level, listeners = clients.size, message = msg) }
                     peak = 0; lastReport = now
                 }
             }
@@ -167,7 +173,7 @@ class HostService : Service() {
         clients.clear()
         runCatching { projection?.stop() }
         projection = null
-        SyncStatus.set("Hosting stopped")
+        AppState.host.value = HostState()
         super.onDestroy()
     }
 }

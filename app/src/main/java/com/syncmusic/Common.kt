@@ -6,10 +6,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Handler
-import android.os.Looper
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
-/** Shared audio format: 48 kHz, 16-bit, stereo PCM = 192 KB/s, fine for local Wi-Fi. */
+/** Shared audio format: 48 kHz, 16-bit, stereo PCM = 192 KB/s, fine for a local link. */
 object Audio {
     const val PORT = 5050
     const val SAMPLE_RATE = 48000
@@ -18,17 +19,40 @@ object Audio {
     val MAGIC = "SYNC".toByteArray()
 }
 
-/** Tiny status bus so the services can show text in the UI. */
-object SyncStatus {
-    private val main = Handler(Looper.getMainLooper())
-    @Volatile var text: String = "Idle"
-        private set
-    var observer: ((String) -> Unit)? = null
-    fun set(s: String) {
-        text = s
-        main.post { observer?.invoke(s) }
-    }
+data class HostState(
+    val running: Boolean = false,
+    val listeners: Int = 0,
+    val level: Float = 0f,
+    val message: String? = null,
+)
+
+data class ListenState(
+    val running: Boolean = false,
+    val playing: Boolean = false,
+    val host: String = "",
+    val message: String? = null,
+)
+
+data class Peer(val name: String, val address: String, val hosting: Boolean, val connected: Boolean)
+
+/** App-wide state the services write and the UI observes. */
+object AppState {
+    val host = MutableStateFlow(HostState())
+    val listen = MutableStateFlow(ListenState())
+    val peers = MutableStateFlow<List<Peer>>(emptyList())
+    val searching = MutableStateFlow(false)
+    val myName = MutableStateFlow<String?>(null)
+    val p2pMessage = MutableStateFlow<String?>(null)
 }
+
+fun localIps(): List<String> = runCatching {
+    NetworkInterface.getNetworkInterfaces().toList()
+        .filter { it.isUp && !it.isLoopback }
+        .flatMap { it.inetAddresses.toList() }
+        .filterIsInstance<Inet4Address>()
+        .mapNotNull { it.hostAddress }
+        .distinct()
+}.getOrDefault(emptyList())
 
 object Notif {
     private const val CHANNEL = "syncmusic"
@@ -43,7 +67,7 @@ object Notif {
         return Notification.Builder(ctx, CHANNEL)
             .setContentTitle("SyncMusic")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_stat)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()

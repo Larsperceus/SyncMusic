@@ -16,8 +16,8 @@
 
     <application
         android:label="SyncMusic"
-        android:icon="@android:drawable/ic_media_play"
-        android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.SyncMusic">
 
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

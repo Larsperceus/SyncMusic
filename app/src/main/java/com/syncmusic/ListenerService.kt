@@ -13,6 +13,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.max
+import kotlinx.coroutines.flow.update
 
 /**
  * Connects to a host and plays the PCM stream. Output goes wherever this phone's
@@ -27,10 +28,12 @@ class ListenerService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val ip = intent?.getStringExtra("ip")
+        val name = intent?.getStringExtra("name") ?: ip ?: ""
         if (ip.isNullOrBlank() || active) return START_NOT_STICKY
         startForeground(2, Notif.build(this, "Listening to $ip"),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
         active = true
+        AppState.listen.value = ListenState(running = true, host = name, message = "Connecting…")
         thread(name = "player") { playLoop(ip.trim()) }
         return START_NOT_STICKY
     }
@@ -60,7 +63,7 @@ class ListenerService : Service() {
 
         while (active) {
             try {
-                SyncStatus.set("Connecting to $ip…")
+                AppState.listen.update { it.copy(playing = false, message = "Connecting…") }
                 val s = Socket().apply { tcpNoDelay = true; connect(InetSocketAddress(ip, Audio.PORT), 5000) }
                 socket = s
                 val input = DataInputStream(s.getInputStream().buffered(Audio.CHUNK * 8))
@@ -68,7 +71,7 @@ class ListenerService : Service() {
                 input.readFully(magic)
                 if (!magic.contentEquals(Audio.MAGIC)) throw IOException("not a SyncMusic host")
 
-                SyncStatus.set("Playing from $ip")
+                AppState.listen.update { it.copy(playing = true, message = null) }
                 track.play()
                 while (active) {
                     val backlog = input.available()
@@ -85,7 +88,7 @@ class ListenerService : Service() {
             } catch (e: Exception) {
                 if (!active) break
                 runCatching { track.pause(); track.flush() }
-                SyncStatus.set("Disconnected (${e.message ?: "error"}). Retrying…")
+                AppState.listen.update { it.copy(playing = false, message = "Lost the connection. Reconnecting…") }
                 try { Thread.sleep(1500) } catch (_: InterruptedException) { break }
             } finally {
                 runCatching { socket?.close() }
@@ -98,7 +101,7 @@ class ListenerService : Service() {
     override fun onDestroy() {
         active = false
         runCatching { socket?.close() }
-        SyncStatus.set("Listening stopped")
+        AppState.listen.value = ListenState()
         super.onDestroy()
     }
 }
