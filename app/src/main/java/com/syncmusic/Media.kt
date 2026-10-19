@@ -72,6 +72,7 @@ object Media {
             art = m?.getBitmap(MediaMetadata.METADATA_KEY_ART) ?: m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART),
             playing = c?.playbackState?.state == PlaybackState.STATE_PLAYING,
         )
+        if (HostControls.local != null) return     // songs on this phone: LocalSource reports instead
         val old = AppState.nowPlaying.value
         AppState.nowPlaying.value = if (np.art == null && np.title == old.title) np.copy(art = old.art) else np
         listener?.invoke(AppState.nowPlaying.value)
@@ -85,4 +86,13 @@ object Media {
 
     fun next() { controller?.transportControls?.skipToNext() }
     fun previous() { controller?.transportControls?.skipToPrevious() }
+}
+
+/** Play/pause/skip for whatever the sharing phone is playing: its own songs, or another app. */
+object HostControls {
+    @Volatile var local: LocalSource? = null
+
+    fun playPause() { val l = local; if (l != null) l.playPause() else Media.playPause() }
+    fun next() { val l = local; if (l != null) l.next() else Media.next() }
+    fun previous() { val l = local; if (l != null) l.previous() else Media.previous() }
 }

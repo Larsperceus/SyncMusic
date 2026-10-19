@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
+import android.net.Uri
+import android.os.PowerManager
 import android.media.projection.MediaProjectionManager
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
@@ -51,11 +53,25 @@ class MainActivity : ComponentActivity() {
             }
             startForegroundService(Intent(this, HostService::class.java)
                 .putExtra("code", r.resultCode).putExtra("data", r.data))
-            if (granted(wifiPerms())) {
-                val (ssid, pass) = Prefs.hostCreds(this)
-                P2p.createGroup(ssid, pass) { AppState.p2pMessage.value = it }
-            } else AppState.p2pMessage.value = "Nearby-devices permission is off, so friends need to connect by IP."
+            startGroup()
         }
+
+    private val localPicker =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isEmpty()) return@registerForActivityResult
+            uris.forEach { runCatching { contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) } }
+            startForegroundService(Intent(this, HostService::class.java)
+                .putExtra("mode", "local")
+                .putParcelableArrayListExtra("uris", ArrayList<Uri>(uris)))
+            startGroup()
+        }
+
+    private fun startGroup() {
+        if (granted(wifiPerms())) {
+            val (ssid, pass) = Prefs.hostCreds(this)
+            P2p.createGroup(ssid, pass) { AppState.p2pMessage.value = it }
+        } else AppState.p2pMessage.value = "Nearby-devices permission is off, so friends need to connect by IP."
+    }
 
     private val scanLauncher = registerForActivityResult(ScanContract()) { r ->
         val text = r.contents ?: return@registerForActivityResult
@@ -133,13 +149,53 @@ class MainActivity : ComponentActivity() {
                 runCatching { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
             },
             setSyncOffset = { Prefs.saveSyncOffset(this, it) },
+            startLocal = {
+                ensurePerms(emptyList(), wifiPerms() + notifPerm()) { localPicker.launch(arrayOf("audio/*")) }
+            },
+            react = { e ->
+                val h = HostService.instance
+                if (h != null) h.react(myName(), e)
+                else ListenerLink.send?.invoke(Msg.REACT, bytes { writeUTF(e) })
+            },
+            request = { text ->
+                val send = ListenerLink.send
+                if (send == null) toast("Join a friend first.")
+                else { send(Msg.REQUEST, bytes { writeUTF(text) }); toast("Request sent") }
+            },
+            setVolume = { id, v -> HostService.instance?.setVolume(id, v) },
+            kick = { id -> HostService.instance?.kick(id) },
+            dismissRequest = { id -> AppState.requests.value = AppState.requests.value.filterNot { it.id == id } },
+            setAutoComp = { Prefs.saveAutoComp(this, it) },
+            allowBattery = {
+                runCatching {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                }
+            },
+            installUpdate = { Updates.install(this, it) },
         )
         setContent { SyncTheme { SyncApp(actions) } }
+        Updates.checkGithub(this)
+        handleIntent(intent)
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(i: Intent?) {
+        if (i?.getBooleanExtra("autoShare", false) == true && !AppState.host.value.running) {
+            i.removeExtra("autoShare")
+            startSharing()
+        }
+    }
+
+    private fun myName() = AppState.myName.value ?: Build.MODEL
 
     override fun onResume() {
         super.onResume()
         AppState.mediaAccess.value = Media.hasAccess(this)
+        AppState.batteryOk.value = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         Media.start(this)
     }
 

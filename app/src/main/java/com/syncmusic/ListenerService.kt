@@ -4,11 +4,12 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.BitmapFactory
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
+import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import kotlinx.coroutines.flow.update
 import java.io.BufferedInputStream
@@ -18,60 +19,90 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
-import kotlin.math.max
 
 /** Estimates the host's clock from ping round-trips (keeps the fastest recent sample). */
 class ClockSync {
     private val samples = ArrayDeque<Pair<Long, Long>>()
     @Volatile var offset: Long? = null
         private set
+    @Volatile var rtt: Long? = null
+        private set
 
     @Synchronized
     fun onPong(t0: Long, hostNow: Long, t3: Long) {
         samples.addLast((t3 - t0) to (hostNow - (t0 + t3) / 2))
         if (samples.size > 12) samples.removeFirst()
-        offset = samples.minBy { it.first }.second
+        val best = samples.minBy { it.first }
+        offset = best.second
+        rtt = best.first
     }
 }
 
-private class Chunk(val t: Long, val pcm: ByteArray)
-
-/**
- * Receives the stream and plays every sound at (capture time + target delay) on the
- * host's clock, so all listeners stay in step with each other.
- */
+/** Receives the stream and plays it in step with every other listener. */
 class ListenerService : Service() {
 
     @Volatile private var active = false
     @Volatile private var socket: Socket? = null
+    private var wake: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private val main = Handler(Looper.getMainLooper())
+    private var hostName = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == Act.STOP) { stopSelf(); return START_NOT_STICKY }
         val ip = intent?.getStringExtra("ip")
         if (ip.isNullOrBlank() || active) return START_NOT_STICKY
-        val name = intent.getStringExtra("name") ?: ip
-        startForeground(2, Notif.build(this, "Listening along with $name"),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        hostName = intent.getStringExtra("name") ?: ip
+        startForeground(2, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        P2p.init(this)
+        locks(true)
         active = true
-        AppState.listen.value = ListenState(running = true, host = name, message = "Connecting…")
+        AppState.listen.value = ListenState(running = true, host = hostName, message = "Connecting…")
         AppState.remoteNow.value = NowPlaying()
+        AppState.peerUpdate.value = null
         thread(name = "listener") { loop(ip.trim()) }
         return START_NOT_STICKY
     }
 
+    private fun notification() = Notif.build(
+        this, "Listening along",
+        AppState.remoteNow.value.title.ifBlank { "With $hostName" },
+        listOf(Notif.action(this, R.drawable.ic_stop, "Stop", ListenerService::class.java, Act.STOP, 20)),
+    )
+
+    private fun locks(on: Boolean) {
+        if (on) {
+            wake = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SyncMusic:listen").apply { acquire(6 * 60 * 60 * 1000L) }
+            wifiLock = getSystemService(WifiManager::class.java)
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "SyncMusic:listen").apply { acquire() }
+        } else {
+            runCatching { wake?.release() }
+            runCatching { wifiLock?.release() }
+        }
+    }
+
     private fun loop(ip: String) {
+        var failures = 0
         while (active) {
             try {
                 session(ip)
+                failures = 0
             } catch (e: Exception) {
                 if (!active) break
+                failures++
                 val msg = if (e.message?.startsWith("Update") == true) e.message
                     else "Lost the connection. Reconnecting…"
                 AppState.listen.update { it.copy(playing = false, latencyMs = null, message = msg) }
+                // The Wi-Fi Direct link itself may have dropped: rejoin the group every few tries.
+                val last = AppState.lastHost.value
+                if (ip.startsWith("192.168.49.") && last != null && failures % 3 == 0) {
+                    main.post { P2p.join(last) { } }
+                }
                 try { Thread.sleep(1500) } catch (_: InterruptedException) { break }
             } finally {
                 runCatching { socket?.close() }
@@ -88,14 +119,20 @@ class ListenerService : Service() {
         inp.readFully(magic)
         if (!magic.contentEquals(Audio.MAGIC)) throw IOException("Update SyncMusic on both phones to the same version.")
 
-        fun send(type: Int, data: ByteArray = ByteArray(0)) = synchronized(out) {
-            out.writeFrame(Frame(type, data)); out.flush()
+        val send: (Int, ByteArray) -> Unit = { type, data ->
+            synchronized(out) { out.writeFrame(Frame(type, data)); out.flush() }
         }
+        ListenerLink.send = { t, d -> thread { runCatching { send(t, d) } } }
         send(Msg.HELLO, bytes { writeUTF(AppState.myName.value ?: Build.MODEL) })
 
         val clock = ClockSync()
-        val player = Player(clock)
+        val player = SyncPlayer({ clock.offset }) {
+            AppState.listen.update { it.copy(playing = true, message = null) }
+        }
         player.start()
+        val received = AtomicLong(0)
+        var opus = false
+
         val pinger = thread(name = "ping") {
             var i = 0
             try {
@@ -106,31 +143,61 @@ class ListenerService : Service() {
             } catch (_: Exception) {
             }
         }
+        val diag = thread(name = "diag") {
+            var lastBytes = 0L
+            try {
+                while (active && !s.isClosed) {
+                    Thread.sleep(1000)
+                    val b = received.get()
+                    val kbps = (b - lastBytes) * 8 / 1000
+                    lastBytes = b
+                    AppState.listen.update {
+                        it.copy(latencyMs = player.latencyMs, deviceLatencyMs = player.deviceLatencyMs, device = player.deviceName)
+                    }
+                    AppState.listenDiag.value = listOf(
+                        "Format" to if (opus) "Opus, compressed" else "Raw audio",
+                        "Receiving" to "$kbps kbit/s",
+                        "Round trip" to (clock.rtt?.let { "$it ms" } ?: "Measuring…"),
+                        "Behind sharing phone" to (player.latencyMs?.let { "$it ms" } ?: "–"),
+                        "Target" to "${Audio.BASE_LATENCY_MS + AppState.syncOffsetMs.value} ms",
+                        "Headphone delay" to (player.deviceLatencyMs?.let { "$it ms" } ?: "Not reported"),
+                        "Output" to (player.deviceName ?: "–"),
+                        "Speed correction" to "%+.2f%%".format(player.speedPct),
+                        "Late audio skipped" to "${player.lateDrops}",
+                        "Gaps filled" to "${player.gapMs} ms",
+                        "Buffered" to "${player.queuedMs()} ms",
+                    )
+                }
+            } catch (_: InterruptedException) {
+            }
+        }
 
         var decoder: OpusDecoder? = null
         try {
             while (active) {
                 val f = inp.readFrame()
+                received.addAndGet(f.data.size + 5L)
                 when (f.type) {
                     Msg.CSD -> {
                         decoder?.release()
-                        decoder = try { OpusDecoder(parseCsd(f.data)) } catch (_: Exception) { send(Msg.WANT_PCM); null }
+                        decoder = try { OpusDecoder(parseCsd(f.data)) } catch (_: Exception) { send(Msg.WANT_PCM, ByteArray(0)); null }
                     }
                     Msg.OPUS -> {
                         val d = decoder ?: continue
-                        val r = f.data.reader()
-                        val t = r.readLong()
+                        opus = true
+                        val t = f.data.reader().readLong()
                         val pkt = f.data.copyOfRange(8, f.data.size)
                         try {
-                            d.decode(pkt, t * 1000) { pcm, pts -> player.offer(Chunk(pts / 1000, pcm)) }
+                            d.decode(pkt, t * 1000) { pcm, pts -> player.offer(Chunk(pts / 1000, bytesToShorts(pcm))) }
                         } catch (_: Exception) {
-                            d.release(); decoder = null
-                            send(Msg.WANT_PCM)
+                            d.release(); decoder = null; opus = false
+                            send(Msg.WANT_PCM, ByteArray(0))
                         }
                     }
                     Msg.PCM -> {
+                        opus = false
                         val t = f.data.reader().readLong()
-                        player.offer(Chunk(t, f.data.copyOfRange(8, f.data.size)))
+                        player.offer(Chunk(t, bytesToShorts(f.data.copyOfRange(8, f.data.size))))
                     }
                     Msg.PONG -> {
                         val r = f.data.reader()
@@ -140,6 +207,7 @@ class ListenerService : Service() {
                         val r = f.data.reader()
                         val title = r.readUTF(); val artist = r.readUTF(); val playing = r.readBoolean()
                         AppState.remoteNow.update { it.copy(title = title, artist = artist, playing = playing) }
+                        main.post { if (active) Notif.update(this, 2, notification()) }
                     }
                     Msg.ART -> {
                         val bmp = if (f.data.isEmpty()) null
@@ -149,95 +217,43 @@ class ListenerService : Service() {
                     Msg.HOSTINFO -> {
                         val r = f.data.reader()
                         val name = r.readUTF(); val ssid = r.readUTF(); val pass = r.readUTF()
+                        val version = runCatching { r.readLong() }.getOrDefault(0L)
+                        hostName = name
                         AppState.listen.update { it.copy(host = name) }
                         if (ssid.isNotEmpty()) Prefs.saveLastHost(this, JoinInfo(name, ssid, pass))
+                        if (version > appVersion(this)) AppState.peerUpdate.value =
+                            UpdateOffer(version, "http://$ip:${Audio.WEB_PORT}/app.apk", name)
+                    }
+                    Msg.VOLUME -> player.volume = f.data.reader().readFloat().coerceIn(0f, 1f)
+                    Msg.REACTION -> {
+                        val r = f.data.reader()
+                        AppState.reactions.tryEmit(Reaction(r.readUTF(), r.readUTF()))
+                    }
+                    Msg.KICK -> {
+                        active = false
+                        AppState.p2pMessage.value = "$hostName removed you from the session."
+                        main.post { stopSelf() }
+                        break
                     }
                 }
             }
         } finally {
+            ListenerLink.send = null
             player.stop()
             decoder?.release()
             pinger.interrupt()
-        }
-    }
-
-    private inner class Player(private val clock: ClockSync) {
-        private val queue = ArrayBlockingQueue<Chunk>(200)
-        @Volatile private var running = true
-        private var worker: Thread? = null
-
-        fun offer(c: Chunk) { while (!queue.offer(c)) queue.poll() }
-        fun start() { worker = thread(name = "player") { play() } }
-        fun stop() { running = false; worker?.interrupt(); runCatching { worker?.join(500) } }
-
-        private fun play() {
-            val minBuf = AudioTrack.getMinBufferSize(
-                Audio.SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE)
-                    .build())
-                .setAudioFormat(AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(Audio.SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build())
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                .setBufferSizeInBytes(max(minBuf * 2, Audio.CHUNK * 3))
-                .build()
-            val silence = ByteArray(Audio.CHUNK)
-            var written = 0L
-            var lastReport = 0L
-            var smoothed = -1.0
-            var started = false
-            try {
-                track.play()
-                while (running && active) {
-                    val c = try { queue.poll(300, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { break } ?: continue
-                    if (!started) {
-                        started = true
-                        AppState.listen.update { it.copy(playing = true, message = null) }
-                    }
-                    val off = clock.offset
-                    if (off != null) {
-                        val now = SystemClock.elapsedRealtime()
-                        val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-                        val pendingMs = (written - head).coerceAtLeast(0) * 1000 / Audio.SAMPLE_RATE
-                        val latency = now + off - c.t + pendingMs
-                        val target = Audio.BASE_LATENCY_MS + AppState.syncOffsetMs.value
-                        smoothed = if (smoothed < 0) latency.toDouble() else smoothed * 0.9 + latency * 0.1
-                        if (now - lastReport > 500) {
-                            lastReport = now
-                            AppState.listen.update { it.copy(latencyMs = smoothed.toInt()) }
-                        }
-                        if (latency > target + 45) continue          // running late: skip ahead
-                        if (latency < target - 45) {                 // running early: wait
-                            var gap = ((target - latency) * Audio.SAMPLE_RATE / 1000).toInt()
-                            while (gap > 0) {
-                                val n = minOf(gap, silence.size / Audio.BYTES_PER_FRAME)
-                                track.write(silence, 0, n * Audio.BYTES_PER_FRAME)
-                                written += n; gap -= n
-                            }
-                        }
-                    }
-                    track.write(c.pcm, 0, c.pcm.size)
-                    written += c.pcm.size / Audio.BYTES_PER_FRAME
-                }
-            } finally {
-                runCatching { track.stop() }
-                track.release()
-            }
+            diag.interrupt()
         }
     }
 
     override fun onDestroy() {
         active = false
         runCatching { socket?.close() }
+        locks(false)
+        ListenerLink.send = null
         AppState.listen.value = ListenState()
         AppState.remoteNow.value = NowPlaying()
+        AppState.listenDiag.value = emptyList()
         super.onDestroy()
     }
 }
