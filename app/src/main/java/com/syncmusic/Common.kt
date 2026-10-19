@@ -71,8 +71,9 @@ data class JoinInfo(val name: String, val ssid: String, val pass: String) {
     fun toQr() = listOf("SYNCMUSIC", "1", name.replace("|", " "), ssid, pass).joinToString("|")
 
     fun toWifiQr(): String {
-        fun esc(s: String) = s.replace("\\", "\\\\").replace(";", "\;").replace(",", "\\,")
-            .replace(":", "\\:").replace("\"", "\\\"")
+        fun esc(s: String) = buildString {
+            for (ch in s) { if (ch in "\\;,:\"") append('\\'); append(ch) }
+        }
         return "WIFI:T:WPA;S:${esc(ssid)};P:${esc(pass)};;"
     }
 
