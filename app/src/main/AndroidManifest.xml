@@ -35,13 +35,6 @@
             android:foregroundServiceType="mediaProjection|mediaPlayback" />
         <service android:name=".ListenerService" android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
-        <service android:name=".MediaListener" android:exported="true"
-            android:label="SyncMusic song info"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
-            <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
-            </intent-filter>
-        </service>
         <service android:name=".ShareTile" android:exported="true"
             android:label="SyncMusic"
             android:icon="@drawable/ic_stat"

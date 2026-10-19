@@ -227,11 +227,8 @@ private fun ColumnScope.SharePane(host: HostState, a: Actions) {
         if (!np.isEmpty) NowPlayingCard(np, accent = Palette.Coral, controls = true)
     } else if (access) {
         if (!np.isEmpty) NowPlayingCard(np, accent = Palette.Coral, controls = true)
-    } else if (!useLocal || host.running) {
-        Notice(
-            "Show the song on your friends' phones and control playback from here.",
-            action = "Allow access", onAction = a.allowMediaAccess,
-        )
+    } else if (!useLocal && !host.running) {
+        Notice("Want the song title and controls on everyone's phone? Use Songs on this phone.")
     }
 
     if (host.running) {
