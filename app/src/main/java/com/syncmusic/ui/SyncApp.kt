@@ -782,7 +782,7 @@ private fun Diagnostics(rows: List<Pair<String, String>>) {
 @Composable
 private fun BatteryNotice(a: Actions) {
     val ok by AppState.batteryOk.collectAsState()
-    if (!ok) Notice("Keep SyncMusic playing when the screen is off.", action = "Allow", onAction = a.allowBattery)
+    if (!ok) Notice("Keep SyncMusic playing when the screen is off: set SyncMusic to Unrestricted or Not optimized.", action = "Open", onAction = a.allowBattery)
 }
 
 @Composable

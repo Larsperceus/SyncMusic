@@ -168,7 +168,7 @@ class MainActivity : ComponentActivity() {
             setAutoComp = { Prefs.saveAutoComp(this, it) },
             allowBattery = {
                 runCatching {
-                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                 }
             },
             installUpdate = { Updates.install(this, it) },
